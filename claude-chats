@@ -578,49 +578,82 @@ def main():
         # Only count sessions with zero real content (no user or assistant messages)
         empty_indices = [i for i, c in enumerate(chats) if c["truly_empty"]]
         empty_hint = f"  {DIM}ctrl-d{RESET} purge {len(empty_indices)} empty" if empty_indices else ""
-
-        keys_line = f"  {DIM}enter{RESET} resume  {DIM}space{RESET} select  {DIM}ctrl-x{RESET} delete  {DIM}backspace{RESET} back  {DIM}esc{RESET} quit{empty_hint}"
-        header = (
-            f"  {BOLD}{project_name}{RESET}  {DIM}{len(chats)} conversations{RESET}\n"
-            f"{keys_line}"
-        )
         script = os.path.realpath(__file__)
         preview = f'"{script}" --preview "$(sed -n "$(expr {{n}} + 1)p" {map_path})"'
-        key, selected = fzf(
-            chat_lines, header, multi=True,
-            prompt=" ",
-            preview_cmd=preview, expect_keys=["bs", "ctrl-d", "ctrl-x"],
-        )
+
+        # Chat view loop (ctrl-p toggles without leaving)
+        leave_chat = False
+        while not leave_chat:
+            skip_perms = cfg.get("skip_permissions", False)
+            perms_indicator = f"{GREEN}skip-perms{RESET}" if skip_perms else f"{DIM}skip-perms{RESET}"
+            keys_line = f"  {DIM}enter{RESET} resume  {DIM}ctrl-p{RESET} {perms_indicator}  {DIM}ctrl-x{RESET} delete  {DIM}backspace{RESET} back  {DIM}esc{RESET} quit{empty_hint}"
+            header = (
+                f"  {BOLD}{project_name}{RESET}  {DIM}{len(chats)} conversations{RESET}\n"
+                f"{keys_line}"
+            )
+            key, selected = fzf(
+                chat_lines, header, multi=True,
+                prompt=" ",
+                preview_cmd=preview, expect_keys=["bs", "ctrl-d", "ctrl-x", "ctrl-p"],
+            )
+
+            if key == "esc":
+                os.unlink(map_path)
+                return
+            if key == "ctrl-p":
+                cfg["skip_permissions"] = not cfg.get("skip_permissions", False)
+                save_config(cfg)
+                continue
+            if key == "bs" or (not selected and key not in ("ctrl-d", "ctrl-x")):
+                leave_chat = True
+                break
+
+            # Resume: enter (key="") with a single selection
+            if key == "" and selected:
+                clean = strip_ansi(selected[0]).strip()
+                if clean:
+                    idx = int(clean.split()[0])
+                    session_id = os.path.splitext(os.path.basename(chats[idx]["file"]))[0]
+                    cmd = "claude --resume " + session_id
+                    if cfg.get("skip_permissions", False):
+                        cmd += " --dangerously-skip-permissions"
+                    # Decode project directory from encoded folder name
+                    encoded = os.path.basename(path)
+                    project_dir = encoded.replace("-", "/")
+                    if not os.path.isdir(project_dir):
+                        # Try: home prefix is known, rest is a single dir name with hyphens
+                        suffix = encoded[len(HOME_PREFIX) + 2:] if encoded.startswith(f"-{HOME_PREFIX}-") else ""
+                        candidate = os.path.join(str(Path.home()), suffix) if suffix else str(Path.home())
+                        project_dir = candidate if os.path.isdir(candidate) else str(Path.home())
+                    os.unlink(map_path)
+                    resume_file = os.environ.get("_CLAUDE_CHATS_RESUME")
+                    if resume_file:
+                        with open(resume_file, "w") as rf:
+                            rf.write(project_dir + "\n" + cmd)
+                        sys.exit(0)
+                    else:
+                        os.execvp("claude", cmd.split())
+
+            if key == "ctrl-d":
+                if not empty_indices:
+                    continue
+                indices = empty_indices
+            elif key == "ctrl-x":
+                indices = []
+                for line in selected:
+                    clean = strip_ansi(line).strip()
+                    if clean:
+                        indices.append(int(clean.split()[0]))
+
+                if not indices:
+                    continue
+            else:
+                continue
+
+            break
 
         os.unlink(map_path)
-
-        if key == "esc":
-            return
-        if key == "bs" or (not selected and key not in ("ctrl-d", "ctrl-x")):
-            continue
-
-        # Resume: enter (key="") with a single selection
-        if key == "" and selected:
-            clean = strip_ansi(selected[0]).strip()
-            if clean:
-                idx = int(clean.split()[0])
-                session_id = os.path.splitext(os.path.basename(chats[idx]["file"]))[0]
-                os.execvp("claude", ["claude", "--resume", session_id])
-
-        if key == "ctrl-d":
-            if not empty_indices:
-                continue
-            indices = empty_indices
-        elif key == "ctrl-x":
-            indices = []
-            for line in selected:
-                clean = strip_ansi(line).strip()
-                if clean:
-                    indices.append(int(clean.split()[0]))
-
-            if not indices:
-                continue
-        else:
+        if leave_chat:
             continue
 
         os.system("clear")
