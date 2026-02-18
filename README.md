@@ -8,11 +8,13 @@ Claude Code stores conversations as `.jsonl` files in `~/.claude/projects/`. Ove
 
 - **Project browser** &mdash; lists all Claude Code projects with conversation counts
 - **Resume chats** &mdash; press enter to resume any conversation in Claude Code
+- **AI summaries** &mdash; toggle short Gemini-powered summaries with `ctrl-s`
+- **New folder** &mdash; create a new project folder and launch Claude there with `ctrl-f`
 - **Sortable** &mdash; sort projects by name, chat count, or most recent activity
 - **Chat preview** &mdash; shows first and last messages in a side panel (fzf preview pane)
 - **Bulk delete** &mdash; select multiple conversations and delete them with confirmation
 - **Purge empty sessions** &mdash; one-key shortcut to clean up empty/resumed sessions
-- **Single file** &mdash; one Python script, no dependencies beyond fzf
+- **Cross-platform** &mdash; works on Linux, macOS, and Windows
 
 ## Requirements
 
@@ -49,6 +51,7 @@ claude-chats
 |----------|--------------------------------------------|
 | `enter`  | Browse conversations in selected project   |
 | `ctrl-n` | Start new session in selected project      |
+| `ctrl-f` | Create new project folder                  |
 | `tab`    | Cycle sort order (A-Z / Most chats / Recent) |
 | `esc`    | Quit                                       |
 
@@ -58,6 +61,8 @@ claude-chats
 |----------|-------------------------------------|
 | `enter`  | Resume highlighted conversation     |
 | `ctrl-n` | Start new session in current project |
+| `ctrl-s` | Toggle AI summaries (Gemini)        |
+| `ctrl-p` | Toggle skip-permissions mode        |
 | `space`  | Toggle selection                    |
 | `ctrl-a` | Select all                         |
 | `ctrl-x` | Delete selected conversations       |
