@@ -45,17 +45,19 @@ claude-chats
 
 ### Project view
 
-| Key     | Action                                     |
-|---------|--------------------------------------------|
-| `enter` | Browse conversations in selected project   |
-| `tab`   | Cycle sort order (A-Z / Most chats / Recent) |
-| `esc`   | Quit                                       |
+| Key      | Action                                     |
+|----------|--------------------------------------------|
+| `enter`  | Browse conversations in selected project   |
+| `ctrl-n` | Start new session in selected project      |
+| `tab`    | Cycle sort order (A-Z / Most chats / Recent) |
+| `esc`    | Quit                                       |
 
 ### Chat view
 
 | Key      | Action                              |
 |----------|-------------------------------------|
 | `enter`  | Resume highlighted conversation     |
+| `ctrl-n` | Start new session in current project |
 | `space`  | Toggle selection                    |
 | `ctrl-a` | Select all                         |
 | `ctrl-x` | Delete selected conversations       |
