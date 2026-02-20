@@ -114,8 +114,10 @@ def launch_claude(project_dir, cmd, map_path=None, session_file=None):
             os.unlink(map_path)
         except OSError:
             pass
-    # If we have the session file, extract the real cwd from it
-    if session_file:
+    # If we have the session file, use cwd only for new sessions (no --resume).
+    # For resumes, the decoded project dir is correct — the session's cwd may
+    # differ from the project folder where the session is stored.
+    if session_file and "--resume" not in cmd:
         real_cwd = _read_cwd_from_session(session_file)
         if real_cwd and os.path.isdir(real_cwd):
             project_dir = real_cwd
@@ -128,7 +130,9 @@ def launch_claude(project_dir, cmd, map_path=None, session_file=None):
             rf.write(project_dir + "\n" + cmd)
         sys.exit(0)
     else:
-        os.execvp("claude", cmd.split())
+        os.chdir(project_dir)
+        argv = cmd.split()
+        os.execvp(argv[0], argv)
 
 
 # ANSI
@@ -159,6 +163,36 @@ FZF_COLORS = ",".join([
 ])
 
 ANSI_RE = re.compile(r'\033\[[^m]*m')
+
+
+def clear_screen():
+    if IS_WINDOWS:
+        os.system("cls")
+    else:
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+def term_width():
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return 80
+
+
+COMPACT = term_width() < 70
+
+
+def _fzf_version():
+    """Return fzf major.minor as a float, e.g. 0.29 or 0.54."""
+    try:
+        out = subprocess.check_output(["fzf", "--version"], encoding="utf-8", errors="replace")
+        m = re.match(r'(\d+\.\d+)', out.strip())
+        return float(m.group(1)) if m else 0.0
+    except Exception:
+        return 0.0
+
+
+FZF_VER = _fzf_version()
 
 # Sort modes for project list
 SORT_MODES = ["name", "chats", "recent"]
@@ -192,6 +226,12 @@ def save_summaries(cache):
     with open(SUMMARY_CACHE, "w") as f:
         json.dump(cache, f)
 
+
+def _can_skip_perms():
+    """Check if --dangerously-skip-permissions can be used (not root)."""
+    if hasattr(os, "getuid") and os.getuid() == 0:
+        return False
+    return True
 
 def load_gemini_key():
     try:
@@ -266,8 +306,11 @@ def strip_ansi(s):
     return ANSI_RE.sub('', s)
 
 
-def fzf(lines, header, multi=False, prompt=" ", preview_cmd=None, expect_keys=None):
+def fzf(lines, header, multi=False, prompt=" ", preview_cmd=None, expect_keys=None, border_label=None):
     """Run fzf. Returns (key, selections)."""
+    margin = "0,1" if COMPACT else "1,2"
+    border = "rounded" if FZF_VER >= 0.35 else "sharp"
+    info_style = "inline-right" if FZF_VER >= 0.39 else "inline"
     args = [
         "fzf",
         "--header", header,
@@ -277,14 +320,17 @@ def fzf(lines, header, multi=False, prompt=" ", preview_cmd=None, expect_keys=No
         "--prompt", prompt,
         "--pointer", ">",
         "--marker", "*",
-        "--border", "rounded",
-        "--border-label-pos", "3",
-        "--margin", "1,2",
+        "--border", border,
+        "--margin", margin,
         "--padding", "0,1",
-        "--info", "inline-right",
+        "--info", info_style,
         "--color", FZF_COLORS,
         "--ansi",
     ]
+    if FZF_VER >= 0.35:
+        args.extend(["--border-label-pos", "3"])
+        if border_label:
+            args.extend(["--border-label", f" {border_label} "])
     binds = ["ctrl-a:select-all"]
     if multi:
         args.append("--multi")
@@ -292,10 +338,11 @@ def fzf(lines, header, multi=False, prompt=" ", preview_cmd=None, expect_keys=No
     if expect_keys:
         args.extend(["--expect", ",".join(expect_keys)])
     args.extend(["--bind", ",".join(binds)])
-    if preview_cmd:
+    if preview_cmd and not COMPACT:
+        preview_pos = "bottom:40%:wrap:border-top" if term_width() < 100 else "right:50%:wrap:border-left"
         args.extend([
             "--preview", preview_cmd,
-            "--preview-window", "right:50%:wrap:border-left",
+            "--preview-window", preview_pos,
         ])
     try:
         proc = subprocess.Popen(
@@ -324,22 +371,41 @@ def list_projects():
     for entry in os.scandir(PROJECTS_DIR):
         if not entry.is_dir():
             continue
-        name = entry.name
-        if name.startswith(f"-{HOME_PREFIX}-"):
-            name = name[len(HOME_PREFIX) + 2:]
-        elif name.startswith(f"{HOME_PREFIX}-"):
-            name = name[len(HOME_PREFIX) + 1:]
-        elif name in (f"-{HOME_PREFIX}", HOME_PREFIX):
-            name = "~"
+        real = decode_project_dir(entry.path)
+        home = str(Path.home())
+        jb_real = os.path.realpath("/var/jb") if os.path.exists("/var/jb") else None
+        missing = False
+        if jb_real and real.startswith(jb_real):
+            suffix = real[len(jb_real):]
+            name = "/var/jb" + suffix if suffix else "/var/jb"
+        elif real == home:
+            encoded = os.path.basename(entry.path)
+            if encoded in (f"-{HOME_PREFIX}", HOME_PREFIX):
+                name = "~"
+                missing = False
+            else:
+                prefix = f"-{HOME_PREFIX}-"
+                tail = encoded[len(prefix):] if encoded.startswith(prefix) else encoded
+                name = "~/" + tail
+                missing = True
+        elif real.startswith(home + os.sep):
+            name = "~/" + real[len(home) + 1:]
+            missing = not os.path.isdir(real)
+        else:
+            name = real
+            missing = not os.path.isdir(real)
         count = 0
         newest = "0"
-        for f in os.scandir(entry.path):
-            if f.name.endswith(".jsonl") and f.is_file():
-                count += 1
-                mtime = f.stat().st_mtime
-                if str(mtime) > newest:
-                    newest = str(mtime)
-        projects.append((name, count, entry.path, float(newest) if newest != "0" else 0))
+        try:
+            for f in os.scandir(entry.path):
+                if f.name.endswith(".jsonl") and f.is_file():
+                    count += 1
+                    mtime = f.stat().st_mtime
+                    if str(mtime) > newest:
+                        newest = str(mtime)
+        except PermissionError:
+            continue
+        projects.append((name, count, entry.path, float(newest) if newest != "0" else 0, missing))
     return projects
 
 
@@ -451,18 +517,37 @@ def load_chats(project_dir):
     return chats
 
 
-def fmt_project_line(name, count, max_name_len):
-    padding = max_name_len - len(name) + 2
+def fmt_project_line(name, count, max_name_len, missing=False):
+    if COMPACT:
+        max_name = term_width() - 16
+        display_name = name[:max_name - 1] + "~" if len(name) > max_name else name
+        padding = min(max_name, max_name_len) - len(display_name) + 2
+    else:
+        display_name = name
+        padding = max_name_len - len(name) + 2
+    if missing:
+        return f"  {MAGENTA}{display_name}{' ' * padding}{count:>3d} chats{RESET}"
     if count == 0:
-        return f"  {DIM}{name}{' ' * padding}  0 chats{RESET}"
+        return f"  {DIM}{display_name}{' ' * padding}  0 chats{RESET}"
     count_color = GREEN if count < 10 else YELLOW if count < 30 else RED
-    return f"  {BOLD}\033[37m{name}{RESET}{' ' * padding}{count_color}{count:>3d}{RESET} {DIM}chats{RESET}"
+    return f"  {BOLD}\033[37m{display_name}{RESET}{' ' * padding}{count_color}{count:>3d}{RESET} {DIM}chats{RESET}"
 
 
 def fmt_chat_line(idx, chat, idx_width, summary=None):
     date = chat["date"] or ""
     size = chat["size"]
     msg = chat["message"]
+    if COMPACT:
+        # Compact: no date, truncate message to fit
+        max_msg = term_width() - idx_width - 12
+        if msg in ("(empty session)", "(resumed session)"):
+            return f" {DIM}{idx:>{idx_width}} {size:>4s} {msg}{RESET}"
+        display_text = summary or msg
+        if len(display_text) > max_msg:
+            display_text = display_text[:max_msg - 1] + "~"
+        if summary:
+            display_text = f"{CYAN}{display_text}{RESET}"
+        return f" {idx:>{idx_width}} {YELLOW}{size:>4s}{RESET} {display_text}"
     if msg in ("(empty session)", "(resumed session)"):
         return f"  {DIM}{idx:>{idx_width}}  {date:<16s}  {size:>4s}  {msg}{RESET}"
     display = f"{CYAN}{summary}{RESET}" if summary else msg
@@ -729,22 +814,27 @@ def main():
         sort_mode = SORT_MODES[sort_idx]
         sorted_proj = sort_projects(projects, sort_mode)
 
-        total = sum(c for _, c, _, _ in projects)
-        max_name_len = max(len(name) for name, _, _, _ in projects)
+        total = sum(p[1] for p in projects)
+        max_name_len = max(len(p[0]) for p in projects)
 
         lines = []
         project_map = {}
-        for name, count, path, _ in sorted_proj:
-            lines.append(fmt_project_line(name, count, max_name_len))
+        for name, count, path, _, missing in sorted_proj:
+            lines.append(fmt_project_line(name, count, max_name_len, missing))
             project_map[name] = (path, count)
 
-        os.system("cls" if IS_WINDOWS else "clear")
+        clear_screen()
         sort_label = SORT_LABELS[sort_mode]
+        skip_perms = cfg.get("skip_permissions", False)
+        perms_indicator = f"{GREEN}perms{RESET}" if skip_perms else f"{DIM}perms{RESET}"
+        cwd = os.getcwd()
+        home = str(Path.home())
+        cwd_display = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
         header = (
-            f"  {DIM}{total} conversations across {len(projects)} projects{RESET}"
-            f"    {DIM}enter{RESET} browse  {DIM}ctrl-n{RESET} new  {DIM}ctrl-f{RESET} new folder  {DIM}tab{RESET} sort ({CYAN}{sort_label}{RESET})  {DIM}esc{RESET} quit"
+            f"  {DIM}{total} chats, {len(projects)} projects{RESET}\n"
+            f"  {DIM}enter{RESET} open  {DIM}^n{RESET} new  {DIM}^f{RESET} folder  {DIM}^e{RESET} explorer  {DIM}^p{RESET} {perms_indicator}  {DIM}tab{RESET} {CYAN}{sort_label}{RESET}  {DIM}esc{RESET} quit"
         )
-        key, selected = fzf(lines, header, prompt=" Projects > ", expect_keys=["tab", "ctrl-n", "ctrl-f"])
+        key, selected = fzf(lines, header, prompt=" Projects > ", expect_keys=["tab", "ctrl-n", "ctrl-f", "ctrl-p", "ctrl-e"], border_label=cwd_display)
 
         if key == "esc":
             return
@@ -753,19 +843,29 @@ def main():
             cfg["sort"] = SORT_MODES[sort_idx]
             save_config(cfg)
             continue
-        if key == "ctrl-n" and selected:
+        if key == "ctrl-p":
+            cfg["skip_permissions"] = not cfg.get("skip_permissions", False)
+            save_config(cfg)
+            continue
+        if key == "ctrl-e" and selected:
             clean = strip_ansi(selected[0]).strip()
-            pname = clean.split()[0]
+            pname = re.sub(r'\s+\d+\s+chats\s*$', '', clean).strip()
             if pname in project_map:
                 ppath, _ = project_map[pname]
-                cmd = "claude"
-                if cfg.get("skip_permissions", False):
-                    cmd += " --dangerously-skip-permissions"
                 project_dir = decode_project_dir(ppath)
-                launch_claude(project_dir, cmd)
+                if IS_WINDOWS:
+                    subprocess.Popen(["explorer", project_dir])
+                else:
+                    subprocess.Popen(["explorer.exe", subprocess.check_output(["wslpath", "-w", project_dir], text=True).strip()])
+            continue
+        if key == "ctrl-n":
+            cmd = "claude"
+            if cfg.get("skip_permissions", False):
+                cmd += " --dangerously-skip-permissions"
+            launch_claude(os.getcwd(), cmd)
             continue
         if key == "ctrl-f":
-            os.system("cls" if IS_WINDOWS else "clear")
+            clear_screen()
             print(f"\n  {BOLD}New project folder{RESET}")
             print(f"  {DIM}Enter path (~ allowed):{RESET} ", end="", flush=True)
             folder = input().strip()
@@ -779,6 +879,10 @@ def main():
                 print(f"\n  {RED}Error: {e}{RESET}")
                 input(f"\n  {DIM}Press Enter...{RESET}")
                 continue
+            # Create project entry so it shows up even without a chat
+            encoded = re.sub(r'[^a-zA-Z0-9]', '-', folder)
+            project_entry = PROJECTS_DIR / encoded
+            project_entry.mkdir(parents=True, exist_ok=True)
             cmd = "claude"
             if cfg.get("skip_permissions", False):
                 cmd += " --dangerously-skip-permissions"
@@ -788,14 +892,14 @@ def main():
             return
 
         clean = strip_ansi(selected[0]).strip()
-        project_name = clean.split()[0]
+        project_name = re.sub(r'\s+\d+\s+chats\s*$', '', clean).strip()
         if project_name not in project_map:
             continue
 
         path, count = project_map[project_name]
 
         if count == 0:
-            os.system("cls" if IS_WINDOWS else "clear")
+            clear_screen()
             print()
             print(f"  {BOLD}{project_name}{RESET}  {DIM}has no conversations.{RESET}")
             print()
@@ -813,7 +917,7 @@ def main():
             sys.stdout.write(f"  {DIM}Loading {project_name}...{RESET}")
             sys.stdout.flush()
             chats = load_chats(path)
-            os.system("cls" if IS_WINDOWS else "clear")
+            clear_screen()
 
             if not chats:
                 break
@@ -850,12 +954,11 @@ def main():
             indices = None
             while True:
                 skip_perms = cfg.get("skip_permissions", False)
-                perms_indicator = f"{GREEN}skip-perms{RESET}" if skip_perms else f"{DIM}skip-perms{RESET}"
-                summ_indicator = f"{GREEN}summaries{RESET}" if summaries_on else f"{DIM}summaries{RESET}"
-                keys_line = f"  {DIM}enter{RESET} resume  {DIM}ctrl-n{RESET} new  {DIM}ctrl-p{RESET} {perms_indicator}  {DIM}ctrl-s{RESET} {summ_indicator}  {DIM}ctrl-x{RESET} delete  {DIM}backspace{RESET} back  {DIM}esc{RESET} quit{empty_hint}"
+                perms_indicator = f"{GREEN}perms{RESET}" if skip_perms else f"{DIM}perms{RESET}"
+                summ_indicator = f"{GREEN}ai{RESET}" if summaries_on else f"{DIM}ai{RESET}"
                 header = (
-                    f"  {BOLD}{project_name}{RESET}  {DIM}{len(chats)} conversations{RESET}\n"
-                    f"{keys_line}"
+                    f"  {BOLD}{project_name}{RESET}  {DIM}{len(chats)} chats{RESET}\n"
+                    f"  {DIM}ret{RESET} go {DIM}^n{RESET} new {DIM}^p{RESET} {perms_indicator} {DIM}^s{RESET} {summ_indicator} {DIM}^x{RESET} del {DIM}bs{RESET} back"
                 )
                 key, selected = fzf(
                     chat_lines, header, multi=True,
@@ -931,7 +1034,7 @@ def main():
                 break
 
             # Delete confirmation
-            os.system("cls" if IS_WINDOWS else "clear")
+            clear_screen()
             try:
                 cols = os.get_terminal_size().columns
             except OSError:
