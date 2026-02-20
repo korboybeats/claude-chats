@@ -6,15 +6,18 @@ Claude Code stores conversations as `.jsonl` files in `~/.claude/projects/`. Ove
 
 ## Features
 
-- **Project browser** &mdash; lists all Claude Code projects with conversation counts
+- **Project browser** &mdash; lists all Claude Code projects with full paths and conversation counts
 - **Resume chats** &mdash; press enter to resume any conversation in Claude Code
 - **AI summaries** &mdash; toggle short Gemini-powered summaries with `ctrl-s`
+- **New session in cwd** &mdash; `ctrl-n` starts a new chat in your current working directory
 - **New folder** &mdash; create a new project folder and launch Claude there with `ctrl-f`
+- **Open in Explorer** &mdash; `ctrl-e` opens the selected project folder in your file manager
 - **Sortable** &mdash; sort projects by name, chat count, or most recent activity
 - **Chat preview** &mdash; shows first and last messages in a side panel (fzf preview pane)
 - **Bulk delete** &mdash; select multiple conversations and delete them with confirmation
 - **Purge empty sessions** &mdash; one-key shortcut to clean up empty/resumed sessions
-- **Cross-platform** &mdash; works on Linux, macOS, and Windows
+- **Missing directory detection** &mdash; highlights deleted/renamed project directories in magenta
+- **Cross-platform** &mdash; works on Linux, macOS, and Windows (includes `.bat` wrapper)
 
 ## Requirements
 
@@ -50,8 +53,10 @@ claude-chats
 | Key      | Action                                     |
 |----------|--------------------------------------------|
 | `enter`  | Browse conversations in selected project   |
-| `ctrl-n` | Start new session in selected project      |
+| `ctrl-n` | Start new session in current working directory |
 | `ctrl-f` | Create new project folder                  |
+| `ctrl-e` | Open selected project folder in Explorer   |
+| `ctrl-p` | Toggle skip-permissions mode               |
 | `tab`    | Cycle sort order (A-Z / Most chats / Recent) |
 | `esc`    | Quit                                       |
 
