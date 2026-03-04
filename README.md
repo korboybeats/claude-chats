@@ -56,6 +56,8 @@ claude-chats
 | `ctrl-n` | Start new session in current working directory |
 | `ctrl-f` | Create new project folder                  |
 | `ctrl-e` | Open selected project folder in Explorer   |
+| `ctrl-d` | Delete selected project (with confirmation) |
+| `ctrl-x` | Purge all empty chats across all projects  |
 | `ctrl-p` | Toggle skip-permissions mode               |
 | `tab`    | Cycle sort order (A-Z / Most chats / Recent) |
 | `esc`    | Quit                                       |
@@ -70,8 +72,8 @@ claude-chats
 | `ctrl-p` | Toggle skip-permissions mode        |
 | `space`  | Toggle selection                    |
 | `ctrl-a` | Select all                         |
-| `ctrl-x` | Delete selected conversations       |
-| `ctrl-d` | Purge empty sessions (no real content) |
+| `ctrl-d` | Delete selected conversations       |
+| `ctrl-x` | Purge empty sessions (no real content) |
 | `backspace` | Back to project list             |
 | `esc`    | Quit                                |
 
