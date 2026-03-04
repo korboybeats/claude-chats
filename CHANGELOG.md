@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.0
+
+- **Fix keybindings** — `ctrl-d` is delete, `ctrl-x` is purge empty (help text and README were swapped)
+- **Project view keybinds** — `ctrl-d` delete project, `ctrl-x` purge all empty chats globally, `ctrl-e` open explorer
+- **Root guard** — skip-permissions toggle blocked with warning when running as root
+- **Cross-platform explorer** — `ctrl-e` now uses `xdg-open` on native Linux, `open` on macOS (previously crashed outside WSL)
+- **Empty count in header** — chat view shows how many empty sessions exist in the current project
+- **Scanning indicator** — global purge shows "Scanning all projects..." during scan
+- **Code cleanup** — removed dead preview functions, fixed variable shadowing, centralized skip-permissions flag via `_build_cmd()`
+
 ## v0.3.0
 
 - **AI summaries** — `ctrl-s` toggles Gemini-powered short summaries (3-6 words) in place of the full first message. Summaries are cached permanently in `~/.claude/claude-chats-summaries.json` and generated in parallel (4 workers) with progress display
