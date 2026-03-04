@@ -26,18 +26,21 @@ Claude Code stores conversations as `.jsonl` files in `~/.claude/projects/`. Ove
 
 ## Install
 
-### Option 1: Copy to PATH
+### Linux / macOS
+
+Clone the repo and symlink the wrapper into your PATH:
 
 ```sh
-curl -o ~/.local/bin/claude-chats https://raw.githubusercontent.com/korboybeats/claude-chats/main/claude-chats
-chmod +x ~/.local/bin/claude-chats
+git clone https://github.com/korboybeats/claude-chats.git ~/claude-chats
+ln -sf ~/claude-chats/claude-chats ~/.local/bin/claude-chats
 ```
 
-### Option 2: Clone and symlink
+### Windows
 
-```sh
-git clone https://github.com/korboybeats/claude-chats.git
-ln -s "$(pwd)/claude-chats/claude-chats" ~/.local/bin/claude-chats
+Clone the repo and add the directory to your PATH (or copy `claude-chats.bat` to a directory already in PATH, like `C:\Scripts\`):
+
+```powershell
+git clone https://github.com/korboybeats/claude-chats.git C:\Scripts\claude-chats
 ```
 
 Then run:

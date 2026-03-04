@@ -1,7 +1,7 @@
 #!/bin/bash
 # claude-chats - Browse, resume, and manage Claude Code conversations
 _resume=$(mktemp /tmp/.claude-chats-resume.XXXXXX)
-_CLAUDE_CHATS_RESUME=$_resume python3 ~/bin/.claude-chats.py "$@"
+_CLAUDE_CHATS_RESUME=$_resume python3 "$(dirname "$(readlink -f "$0")")/.claude-chats.py" "$@"
 if [ -s "$_resume" ]; then
     dir=$(head -1 "$_resume")
     cmd=$(tail -1 "$_resume")

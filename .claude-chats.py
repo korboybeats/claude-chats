@@ -560,21 +560,22 @@ def fmt_chat_line(idx, chat, idx_width, summary=None):
     date = chat["date"] or ""
     size = chat["size"]
     msg = chat["message"]
+    sid = os.path.splitext(os.path.basename(chat["file"]))[0][:8]
     if COMPACT:
         # Compact: no date, truncate message to fit
-        max_msg = term_width() - idx_width - 12
+        max_msg = term_width() - idx_width - 21
         if msg in ("(empty session)", "(resumed session)"):
-            return f" {DIM}{idx:>{idx_width}} {size:>4s} {msg}{RESET}"
+            return f" {DIM}{idx:>{idx_width}} {sid} {size:>4s} {msg}{RESET}"
         display_text = summary or msg
         if len(display_text) > max_msg:
             display_text = display_text[:max_msg - 1] + "~"
         if summary:
             display_text = f"{CYAN}{display_text}{RESET}"
-        return f" {idx:>{idx_width}} {YELLOW}{size:>4s}{RESET} {display_text}"
+        return f" {idx:>{idx_width}} {DIM}{sid}{RESET} {YELLOW}{size:>4s}{RESET} {display_text}"
     if msg in ("(empty session)", "(resumed session)"):
-        return f"  {DIM}{idx:>{idx_width}}  {date:<16s}  {size:>4s}  {msg}{RESET}"
+        return f"  {DIM}{idx:>{idx_width}}  {sid}  {date:<16s}  {size:>4s}  {msg}{RESET}"
     display = f"{CYAN}{summary}{RESET}" if summary else msg
-    return f"  {idx:>{idx_width}}  {DIM}{date:<16s}{RESET}  {YELLOW}{size:>4s}{RESET}  {display}"
+    return f"  {idx:>{idx_width}}  {DIM}{sid}{RESET}  {DIM}{date:<16s}{RESET}  {YELLOW}{size:>4s}{RESET}  {display}"
 
 
 def sort_projects(projects, mode):
