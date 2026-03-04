@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import urllib.request
 import urllib.error
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -101,7 +102,6 @@ def _read_cwd_from_session(jsonl_path):
                     cwd = data.get("cwd")
                     if cwd:
                         return cwd
-                    break
     except Exception:
         pass
     return None
@@ -179,7 +179,7 @@ def term_width():
         return 80
 
 
-COMPACT = term_width() < 70
+COMPACT = term_width() < 100
 
 
 def _fzf_version():
@@ -233,6 +233,23 @@ def _can_skip_perms():
         return False
     return True
 
+
+def _build_cmd(base, cfg):
+    """Build a claude command, conditionally appending skip-permissions flag."""
+    cmd = base
+    if cfg.get("skip_permissions", False) and _can_skip_perms():
+        cmd += " --dangerously-skip-permissions"
+    return cmd
+
+
+def _is_wsl():
+    """Detect if running under WSL."""
+    try:
+        with open("/proc/version", "r") as f:
+            return "microsoft" in f.read().lower()
+    except (FileNotFoundError, PermissionError):
+        return False
+
 def load_gemini_key():
     try:
         return GEMINI_KEY_FILE.read_text().strip()
@@ -281,12 +298,15 @@ def generate_missing_summaries(api_key, chats, cache):
 
     total = len(missing)
     done = [0]
+    lock = threading.Lock()
 
     def _gen(item):
         sid, msg = item
         result = generate_summary(api_key, msg)
-        done[0] += 1
-        sys.stdout.write(f"\r  Summarizing {done[0]}/{total}...")
+        with lock:
+            done[0] += 1
+            count = done[0]
+        sys.stdout.write(f"\r  Summarizing {count}/{total}...")
         sys.stdout.flush()
         return sid, result
 
@@ -338,8 +358,11 @@ def fzf(lines, header, multi=False, prompt=" ", preview_cmd=None, expect_keys=No
     if expect_keys:
         args.extend(["--expect", ",".join(expect_keys)])
     args.extend(["--bind", ",".join(binds)])
-    if preview_cmd and not COMPACT:
-        preview_pos = "bottom:40%:wrap:border-top" if term_width() < 100 else "right:50%:wrap:border-left"
+    if preview_cmd:
+        if term_width() < 100:
+            preview_pos = "bottom:50%:wrap:border-top"
+        else:
+            preview_pos = "right:50%:wrap:border-left"
         args.extend([
             "--preview", preview_cmd,
             "--preview-window", preview_pos,
@@ -395,17 +418,17 @@ def list_projects():
             name = real
             missing = not os.path.isdir(real)
         count = 0
-        newest = "0"
+        newest = 0.0
         try:
             for f in os.scandir(entry.path):
                 if f.name.endswith(".jsonl") and f.is_file():
                     count += 1
                     mtime = f.stat().st_mtime
-                    if str(mtime) > newest:
-                        newest = str(mtime)
+                    if mtime > newest:
+                        newest = mtime
         except PermissionError:
             continue
-        projects.append((name, count, entry.path, float(newest) if newest != "0" else 0, missing))
+        projects.append((name, count, entry.path, newest, missing))
     return projects
 
 
@@ -566,8 +589,6 @@ def sort_projects(projects, mode):
 
 # ── Preview logic (embedded from claude-chat-preview) ──────────────────────
 
-PREVIEW_FIRST_N = 3
-PREVIEW_LAST_N = 4
 TS_WIDTH = 12
 
 XML_TAG_RE = re.compile(r'<[^>]+>')
@@ -617,19 +638,6 @@ def _preview_fmt_timestamp(ts):
         return " " * TS_WIDTH
 
 
-def _preview_truncate(text, max_lines=5, max_chars=300):
-    lines = text.split("\n")
-    remaining = 0
-    if len(lines) > max_lines:
-        remaining = len(lines) - max_lines
-        lines = lines[:max_lines]
-    text = "\n".join(lines)
-    if len(text) > max_chars:
-        text = text[:max_chars]
-    if remaining:
-        text += f"\n{DIM}+{remaining} more lines{RESET}"
-    return text
-
 
 def _preview_render_message(role, text, ts):
     out = []
@@ -639,7 +647,6 @@ def _preview_render_message(role, text, ts):
     else:
         label = f"{MAGENTA}{BOLD}Claude{RESET}"
     out.append(f"  {label}  {DIM}{time_str}{RESET}")
-    text = _preview_truncate(text)
     for line in text.split("\n"):
         out.append(f"    {line}")
     return "\n".join(out)
@@ -656,12 +663,13 @@ def _preview_read_messages(filepath, seek_from=0, max_bytes=100000):
     messages = []
     with open(filepath, "r", errors="replace") as f:
         if seek_from > 0:
-            f.seek(seek_from)
-            f.readline()
+            f.seek(seek_from - 1)
+            if f.read(1) != "\n":
+                f.readline()
         bytes_read = 0
         for line in f:
             bytes_read += len(line)
-            if bytes_read > max_bytes:
+            if max_bytes and bytes_read > max_bytes:
                 break
             line = line.strip()
             if not line:
@@ -691,45 +699,111 @@ def preview_main(filepath):
         print(f"  {DIM}File not found{RESET}")
         return
 
-    file_size = os.path.getsize(filepath)
-    cols = int(os.environ.get("FZF_PREVIEW_COLUMNS", 0))
-    if not cols:
+    preview_cols = int(os.environ.get("FZF_PREVIEW_COLUMNS", 0))
+    if not preview_cols:
         try:
-            cols = os.get_terminal_size().columns // 2
+            preview_cols = os.get_terminal_size().columns // 2
         except OSError:
-            cols = 40
-    cols = max(cols - 3, 20)
+            preview_cols = 40
+    cols = max(preview_cols - 3, 20)
     sep = f"  {DIM}{CYAN}{'~' * cols}{RESET}"
 
-    first_messages = _preview_read_messages(filepath, seek_from=0, max_bytes=100000)
+    file_size = os.path.getsize(filepath)
+    MAX_SMALL = 500000  # 500KB — read whole file
 
-    read_from = max(0, file_size - 200000)
-    last_messages = []
-    if read_from > 0:
-        last_messages = _preview_read_messages(filepath, seek_from=read_from, max_bytes=200000)
+    try:
+        rows = int(os.environ.get("FZF_PREVIEW_LINES", 0)) or os.get_terminal_size().lines
+    except (OSError, ValueError):
+        rows = 40
 
-    if not first_messages and not last_messages:
-        print(f"\n  {DIM}No messages{RESET}")
+    def _render_msg(role, text, ts, max_lines):
+        """Render a single message, truncating text to max_lines."""
+        lines = text.split("\n")
+        if len(lines) > max_lines:
+            rem = len(lines) - max_lines
+            text = "\n".join(lines[:max_lines]) + f"\n{DIM}+{rem} lines{RESET}"
+        return _preview_render_message(role, text, ts)
+
+    def _count_lines(rendered):
+        """Count terminal lines accounting for line wrapping in the preview pane."""
+        total = 0
+        for line in rendered.split("\n"):
+            visible = re.sub(r'\x1b\[[0-9;]*m', '', line)
+            total += max(1, (len(visible) + preview_cols - 1) // preview_cols) if visible else 1
+        return total
+
+    # Read messages
+    if file_size <= MAX_SMALL:
+        all_msgs = _preview_read_messages(filepath, seek_from=0, max_bytes=0)
+    else:
+        first = _preview_read_messages(filepath, seek_from=0, max_bytes=150000)
+        tail_from = max(0, file_size - 350000)
+        last = _preview_read_messages(filepath, seek_from=tail_from, max_bytes=0)
+        all_msgs = first + last if first and last else first or last
+
+    if not all_msgs:
+        print(f"\n  {DIM}(empty session){RESET}")
         return
 
-    print()
+    # Max lines per individual message text — smaller on tiny screens
+    max_text = max(rows // 8, 2)
+    # Overhead: start(1) + end(1) + skip(3) = 5
+    available = rows - 5
+    n = len(all_msgs)
 
-    if read_from == 0:
-        msgs = first_messages
-        total = len(msgs)
-        if total <= PREVIEW_FIRST_N + PREVIEW_LAST_N:
-            _preview_print_section(msgs, sep)
-        else:
-            _preview_print_section(msgs[:PREVIEW_FIRST_N], sep)
-            skipped = total - PREVIEW_FIRST_N - PREVIEW_LAST_N
-            print(f"\n  {DIM}{YELLOW}        ~ {skipped} skipped{RESET}\n")
-            _preview_print_section(msgs[-PREVIEW_LAST_N:], sep)
+    # Render all messages and measure actual line counts
+    rendered = []
+    for role, text, ts in all_msgs:
+        r = _render_msg(role, text, ts, max_text)
+        rendered.append(r)
+
+    # Check if everything fits (each msg + 1 sep except last)
+    total_lines = sum(_count_lines(r) for r in rendered) + (n - 1)
+    if total_lines <= available:
+        print(f"  {GREEN}── start ──{RESET}")
+        for i, r in enumerate(rendered):
+            print(r)
+            if i < n - 1:
+                print(sep)
+        print(f"  {RED}── end ──{RESET}")
     else:
-        _preview_print_section(first_messages[:PREVIEW_FIRST_N], sep)
-        print(f"\n  {DIM}{YELLOW}        ~  ...  {RESET}\n")
-        _preview_print_section(last_messages[-PREVIEW_LAST_N:], sep)
+        # Greedily pick from start and end, measuring real line counts
+        # Always include at least 1 from each end
+        head_idx, tail_idx = [0], [n - 1] if n > 1 else []
+        used = _count_lines(rendered[0]) + 1
+        if tail_idx:
+            used += _count_lines(rendered[n - 1]) + 1
+        i, j = 1, n - 2
+        from_head = True
+        while i <= j:
+            idx = i if from_head else j
+            cost = _count_lines(rendered[idx]) + 1
+            if used + cost > available:
+                break
+            if from_head:
+                head_idx.append(i)
+                i += 1
+            else:
+                tail_idx.insert(0, j)
+                j -= 1
+            used += cost
+            from_head = not from_head
+        skipped = max(0, j - i + 1)
 
-    print()
+        print(f"  {GREEN}── start ──{RESET}")
+        for k, idx in enumerate(head_idx):
+            print(rendered[idx])
+            if k < len(head_idx) - 1:
+                print(sep)
+        if skipped > 0:
+            print(f"\n  {YELLOW}{BOLD}── {skipped} more messages ──{RESET}\n")
+        else:
+            print(sep)
+        for k, idx in enumerate(tail_idx):
+            print(rendered[idx])
+            if k < len(tail_idx) - 1:
+                print(sep)
+        print(f"  {RED}── end ──{RESET}")
 
 
 # ── Main UI ────────────────────────────────────────────────────────────────
@@ -750,14 +824,20 @@ def print_help():
     print("  tab      Cycle sort order (A-Z / Most chats / Recent)")
     print("  esc      Quit")
     print()
+    print("  ctrl-d   Delete selected project (with confirmation)")
+    print("  ctrl-x   Purge all empty chats across all projects")
+    print("  ctrl-p   Toggle skip-permissions mode")
+    print("  ctrl-e   Open project folder in file explorer")
+    print()
     print("Chat view:")
     print("  enter    Resume highlighted conversation in Claude Code")
     print("  ctrl-n   Start new session in current project")
     print("  space    Toggle selection")
     print("  ctrl-a   Select all")
     print("  ctrl-s   Toggle AI summaries (Gemini)")
-    print("  ctrl-x   Delete selected conversations")
-    print("  ctrl-d   Purge empty sessions (no real content)")
+    print("  ctrl-d   Delete selected conversations")
+    print("  ctrl-x   Purge empty sessions (no real content)")
+    print("  ctrl-p   Toggle skip-permissions mode")
     print("  backspace  Back to project list")
     print("  esc      Quit")
     print()
@@ -765,6 +845,13 @@ def print_help():
 
 
 def main():
+    # Ensure UTF-8 output (Windows pipes default to charmap)
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     # Handle --preview (self-invoked by fzf)
     if len(sys.argv) >= 2 and sys.argv[1] == "--preview":
         if len(sys.argv) >= 3:
@@ -779,7 +866,7 @@ def main():
                 lines = f.readlines()
             if 0 <= idx < len(lines):
                 preview_main(lines[idx].strip())
-        except (ValueError, OSError):
+        except Exception:
             pass
         return
 
@@ -793,6 +880,34 @@ def main():
     # Handle --help
     if len(sys.argv) >= 2 and sys.argv[1] in ("--help", "-h"):
         print_help()
+        return
+
+    # Handle --resume / -r <id>
+    if len(sys.argv) >= 3 and sys.argv[1] in ("--resume", "-r"):
+        fragment = sys.argv[2]
+        matches = []
+        if PROJECTS_DIR.exists():
+            for proj in os.scandir(PROJECTS_DIR):
+                if not proj.is_dir():
+                    continue
+                for f in os.scandir(proj.path):
+                    if f.name.endswith(".jsonl") and f.is_file():
+                        sid = os.path.splitext(f.name)[0]
+                        if sid == fragment or sid.startswith(fragment):
+                            matches.append((sid, proj.path, f.path))
+        if not matches:
+            print(f"No session found matching: {fragment}")
+            sys.exit(1)
+        if len(matches) > 1:
+            print(f"Multiple sessions match '{fragment}':")
+            for sid, _, _ in matches:
+                print(f"  {sid}")
+            sys.exit(1)
+        sid, proj_path, session_file = matches[0]
+        cfg = load_config()
+        cmd = _build_cmd("claude --resume " + sid, cfg)
+        project_dir = decode_project_dir(proj_path)
+        launch_claude(project_dir, cmd, session_file=session_file)
         return
 
     # Check projects directory exists
@@ -830,11 +945,21 @@ def main():
         cwd = os.getcwd()
         home = str(Path.home())
         cwd_display = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
-        header = (
-            f"  {DIM}{total} chats, {len(projects)} projects{RESET}\n"
-            f"  {DIM}enter{RESET} open  {DIM}^n{RESET} new  {DIM}^f{RESET} folder  {DIM}^e{RESET} explorer  {DIM}^p{RESET} {perms_indicator}  {DIM}tab{RESET} {CYAN}{sort_label}{RESET}  {DIM}esc{RESET} quit"
-        )
-        key, selected = fzf(lines, header, prompt=" Projects > ", expect_keys=["tab", "ctrl-n", "ctrl-f", "ctrl-p", "ctrl-e"], border_label=cwd_display)
+        cwd_line = f"  {CYAN}{cwd_display}{RESET}\n" if FZF_VER < 0.35 else ""
+        if COMPACT:
+            header = (
+                f"  {DIM}{total} chats, {len(projects)} projects{RESET}\n"
+                f"{cwd_line}"
+                f"  {DIM}ret{RESET} open {DIM}^n{RESET} new {DIM}^r{RESET} resume {DIM}^f{RESET} folder {DIM}^e{RESET} dir\n"
+                f"  {DIM}^d{RESET} del {DIM}^x{RESET} purge empty {DIM}^p{RESET} {perms_indicator} {DIM}tab{RESET} {CYAN}{sort_label}{RESET} {DIM}esc{RESET} quit"
+            )
+        else:
+            header = (
+                f"  {DIM}{total} chats, {len(projects)} projects{RESET}\n"
+                f"{cwd_line}"
+                f"  {DIM}enter{RESET} open  {DIM}^n{RESET} new  {DIM}^r{RESET} resume ID  {DIM}^f{RESET} folder  {DIM}^e{RESET} explorer  {DIM}^d{RESET} del  {DIM}^x{RESET} purge empty  {DIM}^p{RESET} {perms_indicator}  {DIM}tab{RESET} {CYAN}{sort_label}{RESET}  {DIM}esc{RESET} quit"
+            )
+        key, selected = fzf(lines, header, prompt=" Projects > ", expect_keys=["tab", "ctrl-n", "ctrl-f", "ctrl-p", "ctrl-e", "ctrl-r", "ctrl-d", "ctrl-x"], border_label=cwd_display)
 
         if key == "esc":
             return
@@ -844,8 +969,13 @@ def main():
             save_config(cfg)
             continue
         if key == "ctrl-p":
-            cfg["skip_permissions"] = not cfg.get("skip_permissions", False)
-            save_config(cfg)
+            if not _can_skip_perms():
+                clear_screen()
+                print(f"\n  {RED}Cannot skip permissions when running as root{RESET}")
+                input(f"\n  {DIM}Press Enter...{RESET}")
+            else:
+                cfg["skip_permissions"] = not cfg.get("skip_permissions", False)
+                save_config(cfg)
             continue
         if key == "ctrl-e" and selected:
             clean = strip_ansi(selected[0]).strip()
@@ -853,15 +983,52 @@ def main():
             if pname in project_map:
                 ppath, _ = project_map[pname]
                 project_dir = decode_project_dir(ppath)
-                if IS_WINDOWS:
-                    subprocess.Popen(["explorer", project_dir])
+                try:
+                    if IS_WINDOWS:
+                        subprocess.Popen(["explorer", project_dir])
+                    elif _is_wsl():
+                        subprocess.Popen(["explorer.exe", subprocess.check_output(["wslpath", "-w", project_dir], text=True).strip()])
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", project_dir])
+                    else:
+                        subprocess.Popen(["xdg-open", project_dir])
+                except (FileNotFoundError, OSError):
+                    pass
+            continue
+        if key == "ctrl-r":
+            clear_screen()
+            print(f"\n  {BOLD}Resume by session ID{RESET}")
+            print(f"  {DIM}Enter full or partial ID:{RESET} ", end="", flush=True)
+            fragment = input().strip()
+            if fragment:
+                matches = []
+                for proj in os.scandir(PROJECTS_DIR):
+                    if not proj.is_dir():
+                        continue
+                    try:
+                        for f in os.scandir(proj.path):
+                            if f.name.endswith(".jsonl") and f.is_file():
+                                sid = os.path.splitext(f.name)[0]
+                                if sid == fragment or sid.startswith(fragment):
+                                    matches.append((sid, proj.path, f.path))
+                    except PermissionError:
+                        continue
+                if not matches:
+                    print(f"\n  {RED}No session found matching: {fragment}{RESET}")
+                    input(f"\n  {DIM}Press Enter...{RESET}")
+                elif len(matches) > 1:
+                    print(f"\n  {YELLOW}Multiple sessions match:{RESET}")
+                    for sid, _, _ in matches:
+                        print(f"    {sid}")
+                    input(f"\n  {DIM}Press Enter...{RESET}")
                 else:
-                    subprocess.Popen(["explorer.exe", subprocess.check_output(["wslpath", "-w", project_dir], text=True).strip()])
+                    sid, proj_path, session_file = matches[0]
+                    cmd = _build_cmd("claude --resume " + sid, cfg)
+                    project_dir = decode_project_dir(proj_path)
+                    launch_claude(project_dir, cmd, session_file=session_file)
             continue
         if key == "ctrl-n":
-            cmd = "claude"
-            if cfg.get("skip_permissions", False):
-                cmd += " --dangerously-skip-permissions"
+            cmd = _build_cmd("claude", cfg)
             launch_claude(os.getcwd(), cmd)
             continue
         if key == "ctrl-f":
@@ -883,10 +1050,55 @@ def main():
             encoded = re.sub(r'[^a-zA-Z0-9]', '-', folder)
             project_entry = PROJECTS_DIR / encoded
             project_entry.mkdir(parents=True, exist_ok=True)
-            cmd = "claude"
-            if cfg.get("skip_permissions", False):
-                cmd += " --dangerously-skip-permissions"
+            cmd = _build_cmd("claude", cfg)
             launch_claude(folder, cmd)
+            continue
+        if key == "ctrl-d" and selected:
+            clean = strip_ansi(selected[0]).strip()
+            pname = re.sub(r'\s+\d+\s+chats\s*$', '', clean).strip()
+            if pname in project_map:
+                ppath, pcount = project_map[pname]
+                if pcount == 0:
+                    shutil.rmtree(ppath, ignore_errors=True)
+                else:
+                    clear_screen()
+                    print(f"\n  {YELLOW}{pname}{RESET} has {pcount} chat(s). Delete all?")
+                    answer = input(f"\n  {DIM}(y/N):{RESET} ").strip().lower()
+                    if answer == "y":
+                        shutil.rmtree(ppath, ignore_errors=True)
+                    else:
+                        input(f"\n  {DIM}Press Enter...{RESET}")
+            continue
+        if key == "ctrl-x":
+            # Count empty chats first
+            clear_screen()
+            print(f"\n  {DIM}Scanning all projects...{RESET}", flush=True)
+            empty_files = []
+            for proj in os.scandir(PROJECTS_DIR):
+                if not proj.is_dir():
+                    continue
+                try:
+                    for f in os.scandir(proj.path):
+                        if f.name.endswith(".jsonl") and f.is_file():
+                            chat = parse_one_chat(f.path)
+                            if chat and chat["truly_empty"]:
+                                empty_files.append(f.path)
+                except PermissionError:
+                    continue
+            if not empty_files:
+                clear_screen()
+                print(f"\n  {DIM}No empty chats found{RESET}")
+                input(f"\n  {DIM}Press Enter...{RESET}")
+            else:
+                clear_screen()
+                print(f"\n  {YELLOW}Found {len(empty_files)} empty chat(s) across all projects.{RESET} Delete all?")
+                answer = input(f"\n  {DIM}(y/N):{RESET} ").strip().lower()
+                if answer == "y":
+                    for fpath in empty_files:
+                        os.unlink(fpath)
+                    clear_screen()
+                    print(f"\n  {GREEN}Purged {len(empty_files)} empty chat(s){RESET}")
+                    input(f"\n  {DIM}Press Enter...{RESET}")
             continue
         if not selected:
             return
@@ -899,17 +1111,9 @@ def main():
         path, count = project_map[project_name]
 
         if count == 0:
-            clear_screen()
-            print()
-            print(f"  {BOLD}{project_name}{RESET}  {DIM}has no conversations.{RESET}")
-            print()
-            answer = input(f"  {DIM}Delete empty folder? (y/N):{RESET} ").strip().lower()
-            if answer == "y":
-                shutil.rmtree(path, ignore_errors=True)
-                print(f"\n  {GREEN}{BOLD}Deleted folder.{RESET}\n")
-            else:
-                print(f"\n  {DIM}Skipped.{RESET}\n")
-            input(f"  {DIM}Press Enter...{RESET}")
+            project_dir = decode_project_dir(path)
+            cmd = _build_cmd("claude", cfg)
+            launch_claude(project_dir, cmd)
             continue
 
         # Chat view — stays in this project until user goes back or quits
@@ -942,7 +1146,7 @@ def main():
             chat_lines = build_chat_lines()
 
             empty_indices = [i for i, c in enumerate(chats) if c["truly_empty"]]
-            empty_hint = f"  {DIM}ctrl-d{RESET} purge {len(empty_indices)} empty" if empty_indices else ""
+            empty_hint = f"  {DIM}ctrl-x{RESET} purge {len(empty_indices)} empty" if empty_indices else ""
             script = os.path.realpath(__file__)
             if IS_WINDOWS:
                 preview = f'python "{script}" --preview-idx {{n}} "{map_path}"'
@@ -956,9 +1160,10 @@ def main():
                 skip_perms = cfg.get("skip_permissions", False)
                 perms_indicator = f"{GREEN}perms{RESET}" if skip_perms else f"{DIM}perms{RESET}"
                 summ_indicator = f"{GREEN}ai{RESET}" if summaries_on else f"{DIM}ai{RESET}"
+                empty_suffix = f" {DIM}({len(empty_indices)} empty){RESET}" if empty_indices else ""
                 header = (
-                    f"  {BOLD}{project_name}{RESET}  {DIM}{len(chats)} chats{RESET}\n"
-                    f"  {DIM}ret{RESET} go {DIM}^n{RESET} new {DIM}^p{RESET} {perms_indicator} {DIM}^s{RESET} {summ_indicator} {DIM}^x{RESET} del {DIM}bs{RESET} back"
+                    f"  {BOLD}{project_name}{RESET}  {DIM}{len(chats)} chats{RESET}{empty_suffix}\n"
+                    f"  {DIM}ret{RESET} go {DIM}^n{RESET} new {DIM}^p{RESET} {perms_indicator} {DIM}^s{RESET} {summ_indicator} {DIM}^d{RESET} del {DIM}^x{RESET} purge {DIM}bs{RESET} back"
                 )
                 key, selected = fzf(
                     chat_lines, header, multi=True,
@@ -970,8 +1175,13 @@ def main():
                     os.unlink(map_path)
                     return
                 if key == "ctrl-p":
-                    cfg["skip_permissions"] = not cfg.get("skip_permissions", False)
-                    save_config(cfg)
+                    if not _can_skip_perms():
+                        clear_screen()
+                        print(f"\n  {RED}Cannot skip permissions when running as root{RESET}")
+                        input(f"\n  {DIM}Press Enter...{RESET}")
+                    else:
+                        cfg["skip_permissions"] = not cfg.get("skip_permissions", False)
+                        save_config(cfg)
                     continue
                 if key == "ctrl-s":
                     summaries_on = not summaries_on
@@ -991,9 +1201,7 @@ def main():
                     chat_lines = build_chat_lines()
                     continue
                 if key == "ctrl-n":
-                    cmd = "claude"
-                    if cfg.get("skip_permissions", False):
-                        cmd += " --dangerously-skip-permissions"
+                    cmd = _build_cmd("claude", cfg)
                     project_dir = decode_project_dir(path)
                     launch_claude(project_dir, cmd, map_path)
                 if key == "bs" or (not selected and key not in ("ctrl-d", "ctrl-x")):
@@ -1007,17 +1215,15 @@ def main():
                         idx = int(clean.split()[0])
                         session_file = chats[idx]["file"]
                         session_id = os.path.splitext(os.path.basename(session_file))[0]
-                        cmd = "claude --resume " + session_id
-                        if cfg.get("skip_permissions", False):
-                            cmd += " --dangerously-skip-permissions"
+                        cmd = _build_cmd("claude --resume " + session_id, cfg)
                         project_dir = decode_project_dir(path)
                         launch_claude(project_dir, cmd, map_path, session_file=session_file)
 
-                if key == "ctrl-d":
+                if key == "ctrl-x":
                     if not empty_indices:
                         continue
                     indices = empty_indices
-                elif key == "ctrl-x":
+                elif key == "ctrl-d":
                     indices = []
                     for line in selected:
                         clean = strip_ansi(line).strip()
